@@ -24,6 +24,8 @@ API_URL = "https://ws.audioscrobbler.com/2.0/"
 
 # PATCH: file that remembers the last finished page, next to library.db
 PROGRESS_FILE = "lastimport_progress.txt"
+# PATCH: time of the last completed import, used by --recent
+LAST_RUN_FILE = "lastimport_last_run.txt"
 
 
 class OurTrack(pylast.Track):
@@ -67,9 +69,24 @@ class LastImportPlugin(plugins.BeetsPlugin):
             default=None,
             help="start from this page number",
         )
+        cmd.parser.add_option(
+            "--recent",
+            action="store_true",
+            default=False,
+            help="only add scrobbles made since the last completed import",
+        )
+        cmd.parser.add_option(
+            "--since",
+            default=None,
+            metavar="YYYY-MM-DD",
+            help="with --recent: add scrobbles made since this date",
+        )
 
         def func(lib: Library, opts: optparse.Values, args: list[str]) -> None:
-            import_lastfm(lib, self._log, opts.restart, opts.start_page)
+            if opts.recent or opts.since:
+                import_recent(lib, self._log, opts.since)
+            else:
+                import_lastfm(lib, self._log, opts.restart, opts.start_page)
 
         cmd.func = func
         return [cmd]
@@ -227,7 +244,10 @@ class LibraryIndex:
             or (album and album in self.albums[n]),
         )
 
-    def update(self, tracks: list[Track], log: Logger) -> tuple[int, int]:
+    def update(
+        self, tracks: list[Track], log: Logger, add: bool = False
+    ) -> tuple[int, int]:
+        """Set play counts, or with add=True add them to the stored ones."""
         total = len(tracks)
         found_n = 0
         log.info("Received {} tracks in this page, processing...", total)
@@ -239,14 +259,17 @@ class LibraryIndex:
                 if not ids:
                     continue
                 found_n += 1
-                new = str(track["playcount"])
                 for item_id in ids:
+                    value = track["playcount"]
+                    if add:
+                        value += int(self.counts.get(item_id) or 0)
+                    new = str(value)
                     if self.counts.get(item_id) == new:
                         continue  # unchanged: skip the write
                     item = self.lib.get_item(item_id)
                     if item is None:
                         continue
-                    item[self.FIELD] = track["playcount"]
+                    item[self.FIELD] = value
                     item.store()
                     self.counts[item_id] = new
         unknown = total - found_n
@@ -294,15 +317,33 @@ def _clear_progress() -> None:
         pass
 
 
-# PATCH: fetch a page, retrying on Last.fm / network errors
-def fetch_tracks_retry(
-    user: str, page: int, limit: int, log: Logger
-) -> tuple[list[Track], int]:
+def _last_run_path() -> str:
+    return os.path.join(config.config_dir(), LAST_RUN_FILE)
+
+
+def _read_last_run() -> int:
+    try:
+        with open(_last_run_path(), encoding="ascii") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def _write_last_run(ts: int) -> None:
+    try:
+        with open(_last_run_path(), "w", encoding="ascii") as f:
+            f.write(str(ts))
+    except OSError:
+        pass
+
+
+# PATCH: call Last.fm, retrying on API / network errors
+def _with_retry(fn, what: str, hint: str, log: Logger):
     attempts = config["lastimport"]["error_retries"].get(int)
     wait = config["lastimport"]["error_wait"].get(int)
     for attempt in range(1, attempts + 1):
         try:
-            return fetch_tracks(user, page, limit)
+            return fn()
         except (
             pylast.WSError,
             pylast.NetworkError,
@@ -310,17 +351,17 @@ def fetch_tracks_retry(
         ) as exc:
             if attempt == attempts:
                 log.error(
-                    "Page #{} still failing after {} tries: {}. "
-                    "Run 'beet lastimport' again to resume from here.",
-                    page,
+                    "{} still failing after {} tries: {}. {}",
+                    what,
                     attempts,
                     exc,
+                    hint,
                 )
-                raise UserError(f"Last.fm error on page {page}") from exc
+                raise UserError(f"Last.fm error: {what}") from exc
             delay = wait * attempt
             log.warning(
-                "Page #{} failed ({}). Retry {}/{} in {}s...",
-                page,
+                "{} failed ({}). Retry {}/{} in {}s...",
+                what,
                 exc,
                 attempt,
                 attempts - 1,
@@ -328,6 +369,72 @@ def fetch_tracks_retry(
             )
             time.sleep(delay)
     raise UserError("unreachable")
+
+
+def fetch_tracks_retry(
+    user: str, page: int, limit: int, log: Logger
+) -> tuple[list[Track], int]:
+    return _with_retry(
+        lambda: fetch_tracks(user, page, limit),
+        f"Page #{page}",
+        "Run 'beet lastimport' again to resume from here.",
+        log,
+    )
+
+
+# PATCH: --recent: add only scrobbles made since the last completed run
+def import_recent(lib: Library, log: Logger, since: str | None) -> None:
+    user = config["lastfm"]["user"].as_str()
+    if not user:
+        raise UserError("You must specify a user name for lastimport")
+
+    if since:
+        try:
+            ts = int(time.mktime(time.strptime(since, "%Y-%m-%d")))
+        except ValueError:
+            raise UserError("--since must look like 2026-11-01")
+    else:
+        ts = _read_last_run()
+        if not ts:
+            raise UserError(
+                "No completed 'beet lastimport' recorded yet. Run a full "
+                "'beet lastimport' once, or use --since YYYY-MM-DD."
+            )
+
+    started = int(time.time())
+    log.info(
+        "Fetching scrobbles for @{} since {}",
+        user,
+        time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)),
+    )
+    network = pylast.LastFMNetwork(api_key=config["lastfm"]["api_key"].get(str))
+    played = _with_retry(
+        lambda: pylast.User(user, network).get_recent_tracks(
+            limit=None, time_from=ts + 1, cacheable=False
+        ),
+        "Fetching recent scrobbles",
+        "Nothing was changed; run it again.",
+        log,
+    )
+
+    # Count scrobbles per (artist, title); same matching as the full import.
+    counts: dict[tuple[str, str], int] = {}
+    for p in played:
+        artist = p.track.artist.name if p.track.artist else ""
+        key = ((artist or "").strip(), (p.track.title or "").strip())
+        counts[key] = counts.get(key, 0) + 1
+    log.info("{} scrobbles, {} distinct tracks", len(played), len(counts))
+
+    if counts:
+        tracks: list[Track] = [
+            {"mbid": "", "artist": a, "name": t, "playcount": n}
+            for (a, t), n in counts.items()
+        ]
+        found, unknown = LibraryIndex(lib).update(tracks, log, add=True)
+        log.info("{} tracks updated, {} not in library", found, unknown)
+
+    _write_last_run(started)
+    log.info("... done!")
 
 
 def import_lastfm(
@@ -343,6 +450,7 @@ def import_lastfm(
         raise UserError("You must specify a user name for lastimport")
 
     log.info("Fetching last.fm library for @{}", user)
+    started = int(time.time())
 
     page_total = 1
     page_current = 0
@@ -409,6 +517,7 @@ def import_lastfm(
         _write_progress(page_current)  # PATCH: remember finished page
 
     _clear_progress()  # PATCH: finished, next run starts fresh
+    _write_last_run(started)  # PATCH: --recent picks up from here
     log.info("... done!")
     log.info("finished processing {} song pages", page_total)
     log.info("{} unknown play-counts", unknown_total)
