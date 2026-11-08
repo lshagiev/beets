@@ -50,6 +50,7 @@ class LastImportPlugin(plugins.BeetsPlugin):
                 "retry_limit": 3,
                 "error_retries": 5,
                 "error_wait": 30,
+                "recent_overlap_days": 7,
             }
         )
         self.item_types = {"lastfm_play_count": types.INTEGER}
@@ -73,20 +74,29 @@ class LastImportPlugin(plugins.BeetsPlugin):
             "--recent",
             action="store_true",
             default=False,
-            help="only add scrobbles made since the last completed import",
+            help="only refresh tracks played since the last completed import",
         )
         cmd.parser.add_option(
             "--since",
             default=None,
             metavar="YYYY-MM-DD",
-            help="with --recent: add scrobbles made since this date",
+            help="refresh tracks played since this date",
+        )
+        cmd.parser.add_option(
+            "--prune",
+            action="store_true",
+            default=False,
+            help="full import from page 1: afterwards clear counts on tracks "
+            "Last.fm no longer reports",
         )
 
         def func(lib: Library, opts: optparse.Values, args: list[str]) -> None:
             if opts.recent or opts.since:
                 import_recent(lib, self._log, opts.since)
             else:
-                import_lastfm(lib, self._log, opts.restart, opts.start_page)
+                import_lastfm(
+                    lib, self._log, opts.restart, opts.start_page, opts.prune
+                )
 
         cmd.func = func
         return [cmd]
@@ -199,6 +209,20 @@ class LibraryIndex:
             pos += len(title) + 1
         self.blob = "\n".join(titles)
         self.counts = {int(e): str(v) for e, v in counts}
+        self.seen: set[int] = set()
+
+    def prune(self, log: Logger) -> int:
+        """Clear counts on items no Last.fm track matched in this run."""
+        stale = [i for i in self.counts if i not in self.seen]
+        with self.lib.transaction():
+            for item_id in stale:
+                item = self.lib.get_item(item_id)
+                if item is not None and self.FIELD in item:
+                    del item[self.FIELD]
+                    item.store()
+                self.counts.pop(item_id, None)
+        log.info("Cleared {} play counts Last.fm no longer reports", len(stale))
+        return len(stale)
 
     def _title_contains(self, needle: str) -> list[int]:
         found = []
@@ -244,10 +268,8 @@ class LibraryIndex:
             or (album and album in self.albums[n]),
         )
 
-    def update(
-        self, tracks: list[Track], log: Logger, add: bool = False
-    ) -> tuple[int, int]:
-        """Set play counts, or with add=True add them to the stored ones."""
+    def update(self, tracks: list[Track], log: Logger) -> tuple[int, int]:
+        """Store play counts; remembers which items were matched."""
         total = len(tracks)
         found_n = 0
         log.info("Received {} tracks in this page, processing...", total)
@@ -259,10 +281,9 @@ class LibraryIndex:
                 if not ids:
                     continue
                 found_n += 1
+                self.seen.update(ids)
                 for item_id in ids:
                     value = track["playcount"]
-                    if add:
-                        value += int(self.counts.get(item_id) or 0)
                     new = str(value)
                     if self.counts.get(item_id) == new:
                         continue  # unchanged: skip the write
@@ -349,6 +370,9 @@ def _with_retry(fn, what: str, hint: str, log: Logger):
             pylast.NetworkError,
             pylast.MalformedResponseError,
         ) as exc:
+            # "Track not found" and similar won't change on retry.
+            if isinstance(exc, pylast.WSError) and str(exc.get_id()) == "6":
+                raise
             if attempt == attempts:
                 log.error(
                     "{} still failing after {} tries: {}. {}",
@@ -382,7 +406,12 @@ def fetch_tracks_retry(
     )
 
 
-# PATCH: --recent: add only scrobbles made since the last completed run
+# PATCH: --recent: refresh tracks played since the last run.
+# For each track scrobbled in the window, the user's TOTAL play count is
+# fetched from Last.fm (track.getInfo) and stored, the same number a full
+# import would store. Running it twice gives the same result, so windows
+# may overlap safely; each run re-checks `recent_overlap_days` back to
+# catch scrobbles uploaded late (e.g. from an offline phone).
 def import_recent(lib: Library, log: Logger, since: str | None) -> None:
     user = config["lastfm"]["user"].as_str()
     if not user:
@@ -394,48 +423,73 @@ def import_recent(lib: Library, log: Logger, since: str | None) -> None:
         except ValueError:
             raise UserError("--since must look like 2026-11-01")
     else:
-        ts = _read_last_run()
-        if not ts:
+        last = _read_last_run()
+        if not last:
             raise UserError(
                 "No completed 'beet lastimport' recorded yet. Run a full "
                 "'beet lastimport' once, or use --since YYYY-MM-DD."
             )
+        overlap = config["lastimport"]["recent_overlap_days"].get(int)
+        ts = last - overlap * 86400
 
+    started = int(time.time())
     log.info(
         "Fetching scrobbles for @{} since {}",
         user,
         time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)),
     )
     network = pylast.LastFMNetwork(api_key=config["lastfm"]["api_key"].get(str))
+    network.enable_rate_limit()  # stay within Last.fm's request limits
     played = _with_retry(
         lambda: pylast.User(user, network).get_recent_tracks(
-            limit=None, time_from=ts + 1, cacheable=False
+            limit=None, time_from=ts, cacheable=False
         ),
         "Fetching recent scrobbles",
         "Nothing was changed; run it again.",
         log,
     )
 
-    # Count scrobbles per (artist, title); same matching as the full import.
-    counts: dict[tuple[str, str], int] = {}
+    # Distinct tracks played in the window (case-insensitive).
+    distinct: dict[tuple[str, str], tuple[str, str]] = {}
     for p in played:
-        artist = p.track.artist.name if p.track.artist else ""
-        key = ((artist or "").strip(), (p.track.title or "").strip())
-        counts[key] = counts.get(key, 0) + 1
-    log.info("{} scrobbles, {} distinct tracks", len(played), len(counts))
+        artist = (p.track.artist.name if p.track.artist else "") or ""
+        title = p.track.title or ""
+        key = (artist.strip().lower(), title.strip().lower())
+        distinct.setdefault(key, (artist.strip(), title.strip()))
+    log.info("{} scrobbles, {} distinct tracks", len(played), len(distinct))
 
-    if counts:
-        tracks: list[Track] = [
-            {"mbid": "", "artist": a, "name": t, "playcount": n}
-            for (a, t), n in counts.items()
-        ]
-        found, unknown = LibraryIndex(lib).update(tracks, log, add=True)
-        log.info("{} tracks updated, {} not in library", found, unknown)
+    index = LibraryIndex(lib)
+    tracks: list[Track] = []
+    unknown = 0
+    for n, (artist, title) in enumerate(distinct.values(), 1):
+        probe: Track = {"mbid": "", "artist": artist, "name": title, "playcount": 0}
+        if not index.match(probe):
+            unknown += 1  # not in the library: no need to ask Last.fm
+            continue
+        if n % 50 == 0:
+            log.info("Checking play counts {}/{} ...", n, len(distinct))
+        try:
+            count = _with_retry(
+                lambda: pylast.Track(
+                    artist, title, network, username=user
+                ).get_userplaycount(),
+                f"Play count for {artist} - {title}",
+                "Nothing was changed; run it again.",
+                log,
+            )
+        except pylast.WSError:
+            unknown += 1  # Last.fm doesn't know this track
+            continue
+        probe["playcount"] = int(count or 0)
+        tracks.append(probe)
 
-    # Next --recent starts right after the newest scrobble counted here,
-    # so no scrobble is ever added twice.
-    newest = max((int(p.timestamp) for p in played if p.timestamp), default=0)
-    _write_last_run(max(newest, ts))
+    if tracks:
+        found, _ = index.update(tracks, log)
+        log.info("{} tracks refreshed, {} not in library", found, unknown)
+    elif played:
+        log.info("None of these tracks are in the library")
+
+    _write_last_run(started)
     log.info("... done!")
 
 
@@ -444,9 +498,13 @@ def import_lastfm(
     log: Logger,
     restart: bool = False,
     start_page: int | None = None,
+    prune: bool = False,
 ) -> None:
     user = config["lastfm"]["user"].as_str()
     per_page = config["lastimport"]["per_page"].get(int)
+    if prune:
+        restart = True  # pruning needs one complete pass from page 1
+        start_page = None
 
     if not user:
         raise UserError("You must specify a user name for lastimport")
@@ -478,6 +536,7 @@ def import_lastfm(
 
     found_total = 0
     unknown_total = 0
+    pages_missed = 0
     retry_limit = config["lastimport"]["retry_limit"].get(int)
     # Iterate through a yet to be known page total count
     while page_current < page_total:
@@ -500,6 +559,7 @@ def import_lastfm(
                 found_total += found
                 unknown_total += unknown
                 break
+            pages_missed += 1 if retry == retry_limit - 1 else 0
             log.error("ERROR: unable to read page #{}", page_current + 1)
             if retry < retry_limit:
                 log.info(
@@ -518,6 +578,14 @@ def import_lastfm(
         page_current += 1
         _write_progress(page_current)  # PATCH: remember finished page
 
+    if prune:
+        if pages_missed:
+            log.warning(
+                "{} page(s) came back empty; not pruning. Run --prune again.",
+                pages_missed,
+            )
+        else:
+            index.prune(log)
     _clear_progress()  # PATCH: finished, next run starts fresh
     _write_last_run(started)  # PATCH: --recent picks up from here
     log.info("... done!")
