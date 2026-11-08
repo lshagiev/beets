@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import time
+from bisect import bisect_right
 from typing import TYPE_CHECKING, NamedTuple
 
 import pylast
@@ -10,8 +11,6 @@ from pylast import _extract, _number
 from beets import config, plugins, ui
 from beets.dbcore import types
 from beets.exceptions import UserError
-
-from ._utils.playcount import update_play_counts
 
 if TYPE_CHECKING:
     import optparse
@@ -143,6 +142,130 @@ class CustomUser(pylast.User):
         return self._get_things("getTopTracks", pylast.Track, params, cacheable)
 
 
+# PATCH: in-memory library index. The stock matcher runs up to two full
+# SQL table scans (exact, then substring LIKE) per Last.fm track, i.e.
+# ~1000 scans per page. This loads the needed columns once and matches
+# with the same rules in memory.
+class LibraryIndex:
+    FIELD = "lastfm_play_count"
+
+    def __init__(self, lib: Library) -> None:
+        self.lib = lib
+        with lib.transaction() as tx:
+            rows = tx.query(
+                "SELECT id, title, artist, album, mb_trackid FROM items"
+            )
+            counts = tx.query(
+                "SELECT entity_id, value FROM item_attributes WHERE key = ?",
+                (self.FIELD,),
+            )
+        self.ids: list[int] = []
+        self.artists: list[str] = []
+        self.albums: list[str] = []
+        self.by_title: dict[str, list[int]] = {}
+        self.by_mbid: dict[str, list[int]] = {}
+        titles = []
+        for n, row in enumerate(rows):
+            title = _low(row[1])
+            self.ids.append(row[0])
+            self.artists.append(_low(row[2]))
+            self.albums.append(_low(row[3]))
+            titles.append(title)
+            self.by_title.setdefault(title, []).append(n)
+            if row[4]:
+                self.by_mbid.setdefault(row[4], []).append(n)
+        # All titles in one string so substring search runs in C.
+        self.starts: list[int] = []
+        pos = 0
+        for title in titles:
+            self.starts.append(pos)
+            pos += len(title) + 1
+        self.blob = "\n".join(titles)
+        self.counts = {int(e): str(v) for e, v in counts}
+
+    def _title_contains(self, needle: str) -> list[int]:
+        found = []
+        pos = self.blob.find(needle)
+        while pos != -1:
+            n = bisect_right(self.starts, pos) - 1
+            found.append(n)
+            if n + 1 >= len(self.starts):
+                break
+            pos = self.blob.find(needle, self.starts[n + 1])
+        return found
+
+    def match(self, track: Track) -> list[int]:
+        mbid = track["mbid"]
+        if mbid and mbid in self.by_mbid:
+            return [self.ids[n] for n in self.by_mbid[mbid]]
+
+        title = _low(track["name"])
+        artist = _low(track["artist"])
+        album = _low(track.get("album") or "")
+        variants = {title, title.replace("'", "’")}
+
+        def pick(rows, ok):
+            seen = []
+            for n in rows:
+                if n not in seen and ok(n):
+                    seen.append(n)
+            return [self.ids[n] for n in seen]
+
+        exact = [n for v in variants for n in self.by_title.get(v, ())]
+        hits = pick(
+            exact,
+            lambda n: self.artists[n] == artist
+            or (album and self.albums[n] == album),
+        )
+        if hits:
+            return hits
+
+        sub = [n for v in variants for n in self._title_contains(v)]
+        return pick(
+            sub,
+            lambda n: artist in self.artists[n]
+            or (album and album in self.albums[n]),
+        )
+
+    def update(self, tracks: list[Track], log: Logger) -> tuple[int, int]:
+        total = len(tracks)
+        found_n = 0
+        log.info("Received {} tracks in this page, processing...", total)
+        with self.lib.transaction():
+            for i, track in enumerate(tracks, 1):
+                if i % 250 == 0:
+                    log.info("Processing track {}/{} ...", i, total)
+                ids = self.match(track)
+                if not ids:
+                    continue
+                found_n += 1
+                new = str(track["playcount"])
+                for item_id in ids:
+                    if self.counts.get(item_id) == new:
+                        continue  # unchanged: skip the write
+                    item = self.lib.get_item(item_id)
+                    if item is None:
+                        continue
+                    item[self.FIELD] = track["playcount"]
+                    item.store()
+                    self.counts[item_id] = new
+        unknown = total - found_n
+        if unknown:
+            log.info(
+                "Acquired {}/{} play-counts ({} unknown)",
+                found_n,
+                total,
+                unknown,
+            )
+        return found_n, unknown
+
+
+def _low(s: object) -> str:
+    # SQLite LIKE (used by the stock matcher) is case-insensitive.
+    # Newlines would break the joined title string.
+    return str(s or "").lower().replace("\n", " ")
+
+
 # PATCH: progress-file helpers
 def _progress_path() -> str:
     return os.path.join(config.config_dir(), PROGRESS_FILE)
@@ -237,6 +360,12 @@ def import_lastfm(
         )
         page_total = page_current + 1
 
+    t0 = time.time()
+    index = LibraryIndex(lib)
+    log.info(
+        "Indexed {} library tracks in {:.1f}s", len(index.ids), time.time() - t0
+    )
+
     found_total = 0
     unknown_total = 0
     retry_limit = config["lastimport"]["retry_limit"].get(int)
@@ -257,7 +386,7 @@ def import_lastfm(
                 raise UserError("Last.fm reported no data.")
 
             if tracks:
-                found, unknown = update_play_counts(lib, tracks, log, "lastfm")
+                found, unknown = index.update(tracks, log)
                 found_total += found
                 unknown_total += unknown
                 break
