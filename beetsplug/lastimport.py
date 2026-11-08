@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import time
 from typing import TYPE_CHECKING, NamedTuple
 
 import pylast
@@ -21,6 +23,9 @@ if TYPE_CHECKING:
 
 API_URL = "https://ws.audioscrobbler.com/2.0/"
 
+# PATCH: file that remembers the last finished page, next to library.db
+PROGRESS_FILE = "lastimport_progress.txt"
+
 
 class OurTrack(pylast.Track):
     mbid: str
@@ -37,14 +42,35 @@ class LastImportPlugin(plugins.BeetsPlugin):
         config["lastfm"].add({"user": "", "api_key": plugins.LASTFM_KEY})
         config["lastfm"]["user"].redact = True
         config["lastfm"]["api_key"].redact = True
-        self.config.add({"per_page": 500, "retry_limit": 3})
+        # PATCH: error_retries / error_wait control retrying on API errors
+        self.config.add(
+            {
+                "per_page": 500,
+                "retry_limit": 3,
+                "error_retries": 5,
+                "error_wait": 30,
+            }
+        )
         self.item_types = {"lastfm_play_count": types.INTEGER}
 
     def commands(self) -> list[ui.Subcommand]:
         cmd = ui.Subcommand("lastimport", help="import last.fm play-count")
+        # PATCH: options to choose where to start
+        cmd.parser.add_option(
+            "--restart",
+            action="store_true",
+            default=False,
+            help="ignore saved progress and start from page 1",
+        )
+        cmd.parser.add_option(
+            "--start-page",
+            type="int",
+            default=None,
+            help="start from this page number",
+        )
 
         def func(lib: Library, opts: optparse.Values, args: list[str]) -> None:
-            import_lastfm(lib, self._log)
+            import_lastfm(lib, self._log, opts.restart, opts.start_page)
 
         cmd.func = func
         return [cmd]
@@ -117,7 +143,76 @@ class CustomUser(pylast.User):
         return self._get_things("getTopTracks", pylast.Track, params, cacheable)
 
 
-def import_lastfm(lib: Library, log: Logger) -> None:
+# PATCH: progress-file helpers
+def _progress_path() -> str:
+    return os.path.join(config.config_dir(), PROGRESS_FILE)
+
+
+def _read_progress() -> int:
+    try:
+        with open(_progress_path(), encoding="ascii") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def _write_progress(page: int) -> None:
+    try:
+        with open(_progress_path(), "w", encoding="ascii") as f:
+            f.write(str(page))
+    except OSError:
+        pass
+
+
+def _clear_progress() -> None:
+    try:
+        os.remove(_progress_path())
+    except OSError:
+        pass
+
+
+# PATCH: fetch a page, retrying on Last.fm / network errors
+def fetch_tracks_retry(
+    user: str, page: int, limit: int, log: Logger
+) -> tuple[list[Track], int]:
+    attempts = config["lastimport"]["error_retries"].get(int)
+    wait = config["lastimport"]["error_wait"].get(int)
+    for attempt in range(1, attempts + 1):
+        try:
+            return fetch_tracks(user, page, limit)
+        except (
+            pylast.WSError,
+            pylast.NetworkError,
+            pylast.MalformedResponseError,
+        ) as exc:
+            if attempt == attempts:
+                log.error(
+                    "Page #{} still failing after {} tries: {}. "
+                    "Run 'beet lastimport' again to resume from here.",
+                    page,
+                    attempts,
+                    exc,
+                )
+                raise UserError(f"Last.fm error on page {page}") from exc
+            delay = wait * attempt
+            log.warning(
+                "Page #{} failed ({}). Retry {}/{} in {}s...",
+                page,
+                exc,
+                attempt,
+                attempts - 1,
+                delay,
+            )
+            time.sleep(delay)
+    raise UserError("unreachable")
+
+
+def import_lastfm(
+    lib: Library,
+    log: Logger,
+    restart: bool = False,
+    start_page: int | None = None,
+) -> None:
     user = config["lastfm"]["user"].as_str()
     per_page = config["lastimport"]["per_page"].get(int)
 
@@ -128,6 +223,20 @@ def import_lastfm(lib: Library, log: Logger) -> None:
 
     page_total = 1
     page_current = 0
+    # PATCH: decide where to start
+    if start_page:
+        page_current = max(start_page - 1, 0)
+    elif restart:
+        _clear_progress()
+    else:
+        page_current = _read_progress()
+    if page_current:
+        log.info(
+            "Resuming after page #{} (use --restart to start over)",
+            page_current,
+        )
+        page_total = page_current + 1
+
     found_total = 0
     unknown_total = 0
     retry_limit = config["lastimport"]["retry_limit"].get(int)
@@ -140,7 +249,9 @@ def import_lastfm(lib: Library, log: Logger) -> None:
         )
 
         for retry in range(retry_limit):
-            tracks, page_total = fetch_tracks(user, page_current + 1, per_page)
+            tracks, page_total = fetch_tracks_retry(
+                user, page_current + 1, per_page, log
+            )
             if page_total < 1:
                 # It means nothing to us!
                 raise UserError("Last.fm reported no data.")
@@ -166,7 +277,9 @@ def import_lastfm(lib: Library, log: Logger) -> None:
                     retry + 1,
                 )
         page_current += 1
+        _write_progress(page_current)  # PATCH: remember finished page
 
+    _clear_progress()  # PATCH: finished, next run starts fresh
     log.info("... done!")
     log.info("finished processing {} song pages", page_total)
     log.info("{} unknown play-counts", unknown_total)
