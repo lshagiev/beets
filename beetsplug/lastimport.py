@@ -401,7 +401,6 @@ def import_recent(lib: Library, log: Logger, since: str | None) -> None:
                 "'beet lastimport' once, or use --since YYYY-MM-DD."
             )
 
-    started = int(time.time())
     log.info(
         "Fetching scrobbles for @{} since {}",
         user,
@@ -433,7 +432,10 @@ def import_recent(lib: Library, log: Logger, since: str | None) -> None:
         found, unknown = LibraryIndex(lib).update(tracks, log, add=True)
         log.info("{} tracks updated, {} not in library", found, unknown)
 
-    _write_last_run(started)
+    # Next --recent starts right after the newest scrobble counted here,
+    # so no scrobble is ever added twice.
+    newest = max((int(p.timestamp) for p in played if p.timestamp), default=0)
+    _write_last_run(max(newest, ts))
     log.info("... done!")
 
 
